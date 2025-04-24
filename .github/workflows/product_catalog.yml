@@ -1,32 +1,41 @@
-# CI for Product Catalog Service
-
 name: product-catalog-ci
-
 on:
   pull_request:
     branches:
       - main
+    types:
+      - opened
+      - synchronize
+      - reopened
+    paths:
+      - "**/*"
+
+env:
+  GO_VERSION: 1.22
+  DOCKER_IMAGE: ${{ secrets.DOCKER_USERNAME }}/product-catalog
+  DEPLOY_MANIFEST: kubernetes/productcatalog/deploy.yaml
+  ARGOCD_APP: product-catalog
 
 jobs:
   build:
     runs-on: ubuntu-latest
 
     steps:
-      - name: checkout code
+      - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup Go 1.22
+      - name: Setup Go
         uses: actions/setup-go@v2
         with:
-          go-version: 1.22
+          go-version: ${{ env.GO_VERSION }}
 
-      - name: Build
+      - name: Download Go modules and Build
         run: |
           cd src/product-catalog
           go mod download
           go build -o product-catalog-service main.go
 
-      - name: unit tests
+      - name: Run unit tests
         run: |
           cd src/product-catalog
           go test ./...
@@ -35,66 +44,83 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: checkout code
+      - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup Go 1.22
+      - name: Setup Go
         uses: actions/setup-go@v2
         with:
-          go-version: 1.22
+          go-version: ${{ env.GO_VERSION }}
 
       - name: Run golangci-lint
         uses: golangci/golangci-lint-action@v6
         with:
           version: v1.55.2
-          run: golangci-lint run
           working-directory: src/product-catalog
 
   docker:
     runs-on: ubuntu-latest
-
-    needs: build
+    needs: [build, code-quality]
 
     steps:
-      - name: checkout code
+      - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Install Docker
+      - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v1
 
-      - name: Login to Docker
+      - name: Login to DockerHub
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_TOKEN }}
 
-      - name: Docker Push
+      - name: Build and push Docker image
         uses: docker/build-push-action@v6
         with:
           context: src/product-catalog
           file: src/product-catalog/Dockerfile
           push: true
-          tags: ${{ secrets.DOCKER_USERNAME }}/product-catalog:${{github.run_id}}
+          tags: ${{ env.DOCKER_IMAGE }}:${{ github.run_id }}
 
   updatek8s:
     runs-on: ubuntu-latest
-
     needs: docker
 
     steps:
-      - name: checkout code
+      - name: Checkout code
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Update tag in kubernetes deployment manifest
+      - name: Update image tag in Kubernetes manifest
         run: |
-          sed -i "s|image: .*|image: ${{ secrets.DOCKER_USERNAME }}/product-catalog:${{github.run_id}}|" kubernetes/productcatalog/deploy.yaml
+          sed -i "s|image: .*|image: ${{ env.DOCKER_IMAGE }}:${{ github.run_id }}|" ${{ env.DEPLOY_MANIFEST }}
 
-      - name: Commit and push changes
+      - name: Auto commit updated manifest
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "[CI] Update image tag to ${{ github.run_id }}"
+          file_pattern: ${{ env.DEPLOY_MANIFEST }}
+
+  argocd-sync:
+    runs-on: ubuntu-latest
+    needs: updatek8s
+
+    steps:
+      - name: Install Argo CD CLI
         run: |
-          git config --global user.email "susil.kafle123@gmail.com"
-          git config --global user.name "Sushil-kafle"
-          git add kubernetes/productcatalog/deploy.yaml
-          git commit -m "[CI]: Update product catalog image tag"
-          git push origin HEAD:main -f
+          curl -sSL -o argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+          chmod +x argocd
+          sudo mv argocd /usr/local/bin/
+
+      - name: ArgoCD Login
+        run: |
+          argocd login ${{ secrets.ARGOCD_SERVER }} \
+            --username ${{ secrets.ARGOCD_USERNAME }} \
+            --password ${{ secrets.ARGOCD_PASSWORD }} \
+            --insecure
+
+      - name: Sync Argo CD app
+        run: |
+          argocd app sync ${{ env.ARGOCD_APP }}
